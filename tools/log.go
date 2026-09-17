@@ -15,7 +15,7 @@ func InitLogger(logFile string) {
 	if logFile == "" {
 		return
 	}
-	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[AH-MCP] WARNING: cannot open log file %s: %v\n", logFile, err)
 		return

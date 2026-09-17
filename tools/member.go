@@ -2,8 +2,8 @@ package tools
 
 import (
 	"context"
-	"fmt"
 
+	appie "github.com/gwillem/appie-go"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -14,24 +14,14 @@ func RegisterMemberTools(s *server.MCPServer, deps Deps) {
 		mcp.WithTitleAnnotation("Albert Heijn: Member Profile"),
 		mcp.WithDescription(
 			"Get your Albert Heijn member profile. "+
-				"Returns name, email, member_since, and bonus_card_number (last 4 digits only).",
+				"Returns name, email, date_of_birth, and bonus_card_number (last 4 digits only).",
 		),
 	)
-	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		if !deps.IsAuthenticated() {
-			return notAuthResult(), nil
-		}
-		if err := refreshTokens(ctx, deps); err != nil {
-			return errResult(fmt.Sprintf("Token refresh failed: %v", err)), nil
-		}
-		c, err := deps.GetClient()
-		if err != nil {
-			return errResult(fmt.Sprintf("Client error: %v", err)), nil
-		}
-
+	s.AddTool(tool, withClient(deps, func(ctx context.Context, c *appie.Client, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		member, err := c.GetMember(ctx)
 		if err != nil {
-			return errResult(fmt.Sprintf("Failed to get member profile: %v", err)), nil
+			LogError("ah_get_member_profile", "failed: %v", err)
+			return errResult("Failed to get member profile."), nil
 		}
 
 		// Mask bonus card: show only last 4 digits.
@@ -52,5 +42,5 @@ func RegisterMemberTools(s *server.MCPServer, deps Deps) {
 			BonusCardNumber: bonusCard,
 			DateOfBirth:     member.DateOfBirth,
 		})
-	})
+	}))
 }

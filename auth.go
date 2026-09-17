@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,11 +23,11 @@ import (
 )
 
 const (
-	defaultAHSite    = "nl"
-	ahClientVersion  = "9.28"
-	ahUserAgent      = "Appie/9.28 (iPhone17,3; iPhone; CPU OS 26_1 like Mac OS X)"
-	oauthTimeout     = 5 * time.Minute
-	tokenRefreshBuf  = 60 * time.Second
+	defaultAHSite   = "nl"
+	ahClientVersion = "9.28"
+	ahUserAgent     = "Appie/9.28 (iPhone17,3; iPhone; CPU OS 26_1 like Mac OS X)"
+	oauthTimeout    = 5 * time.Minute
+	tokenRefreshBuf = 60 * time.Second
 
 	loginSuccessHTML = `<!DOCTYPE html>
 <html><head><title>Login Successful</title></head>
@@ -35,6 +37,11 @@ const (
 <script>setTimeout(function(){window.close()},1000)</script>
 </body></html>`
 )
+
+// ahHTTPClient is used for the auth calls this package makes directly
+// (token exchange and refresh). It carries a timeout so a hung AH endpoint
+// cannot block a tool call indefinitely.
+var ahHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
 // tokenFile is the on-disk format — matches appie-go's internal config type
 // so that appie.NewWithConfig can load tokens written by our OAuth flow.
@@ -81,14 +88,6 @@ func ahApplication() string {
 		return "AHBEWEBSHOP"
 	}
 	return "AHWEBSHOP"
-}
-
-// oauthState guards the in-progress OAuth flow so concurrent tool calls are safe.
-var oauthState struct {
-	sync.Mutex
-	active   bool
-	loginURL string
-	done     chan error
 }
 
 // TokensPath returns the path for storing OAuth tokens.
@@ -150,19 +149,28 @@ func IsAuthenticated(path string) bool {
 	return tf.RefreshToken != ""
 }
 
+// refreshMu serialises token refreshes. Without it two concurrent tool calls
+// can both POST the same refresh token; AH rotates refresh tokens, so the
+// loser of that race would persist a token the server has already retired.
+var refreshMu sync.Mutex
+
 // RefreshIfNeeded refreshes the access token if it expires within tokenRefreshBuf.
-// Saves updated tokens on success.
-func RefreshIfNeeded(ctx context.Context, path string) error {
+// Saves updated tokens on success. The bool reports whether a refresh actually
+// happened, so the caller knows the in-memory appie client is now stale.
+func RefreshIfNeeded(ctx context.Context, path string) (bool, error) {
+	refreshMu.Lock()
+	defer refreshMu.Unlock()
+
 	tf, err := LoadTokens(path)
 	if err != nil {
-		return fmt.Errorf("load tokens for refresh: %w", err)
+		return false, fmt.Errorf("load tokens for refresh: %w", err)
 	}
 	if tf == nil || tf.RefreshToken == "" {
-		return fmt.Errorf("no refresh token available")
+		return false, fmt.Errorf("no refresh token available")
 	}
 
 	if !tf.ExpiresAt.IsZero() && time.Until(tf.ExpiresAt) > tokenRefreshBuf {
-		return nil // still valid
+		return false, nil // still valid
 	}
 
 	reqBody := map[string]string{
@@ -171,7 +179,7 @@ func RefreshIfNeeded(ctx context.Context, path string) error {
 	}
 	var tok tokenResponse
 	if err := doAHPost(ctx, "/mobile-auth/v1/auth/token/refresh", reqBody, &tok); err != nil {
-		return fmt.Errorf("refresh token: %w", err)
+		return false, fmt.Errorf("refresh token: %w", err)
 	}
 
 	tf.AccessToken = tok.AccessToken
@@ -179,45 +187,86 @@ func RefreshIfNeeded(ctx context.Context, path string) error {
 	if tok.ExpiresIn > 0 {
 		tf.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
 	}
-	return SaveTokens(path, tf)
+	if err := SaveTokens(path, tf); err != nil {
+		return false, err
+	}
+	tools.LogInfo("auth", "token_refreshed expires_at=%s", tf.ExpiresAt.UTC().Format(time.RFC3339))
+	return true, nil
+}
+
+// flowSecret returns an unguessable path segment used to scope the OAuth
+// proxy. Without it the proxy is an open relay to AH's login host and its
+// /callback accepts an authorization code from anyone who can reach the port
+// (AH's flow carries no state parameter, so that is a login-CSRF: an attacker
+// can bind *their* AH account to this server).
+func flowSecret() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate flow secret: %w", err)
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // StartOAuthFlow starts a temporary reverse-proxy HTTP server on callbackPort,
-// rewrites AH's appie:// redirect to the local /callback handler, exchanges
-// the auth code for tokens, saves them, and returns:
-//   - loginURL: the URL the user must open in their browser
-//   - done: a channel that receives nil on success or an error on failure/timeout
-//   - err: non-nil only if the server could not start
+// rewrites AH's appie:// redirect to the local callback handler, exchanges
+// the auth code for tokens and saves them.
+//
+// Everything is mounted under a random /<secret>/ prefix that is only ever
+// disclosed through the returned login URL, which in turn only reaches the
+// user over the authenticated MCP channel.
 //
 // The proxy approach is necessary because the AH OAuth server only accepts
 // redirect_uri=appie://login-exit (a custom iOS URL scheme). The proxy
 // intercepts this redirect and converts it to an HTTP callback we can receive.
-func StartOAuthFlow(ctx context.Context, callbackHost string, callbackPort int, tokensPath string) (loginURL string, done <-chan error, err error) {
-	addr := fmt.Sprintf("0.0.0.0:%d", callbackPort)
-	listener, listenErr := net.Listen("tcp", addr)
-	if listenErr != nil {
-		return "", nil, fmt.Errorf("start OAuth server on port %d: %w", callbackPort, listenErr)
+func StartOAuthFlow(callbackHost string, callbackPort int, tokensPath string, remote bool) (*tools.OAuthFlow, error) {
+	secret, err := flowSecret()
+	if err != nil {
+		return nil, err
 	}
 
-	target, _ := url.Parse(ahLoginBase())
-	tools.LogInfo("auth", "oauth_start site=%s login_host=%s api_base=%s callback_host=%s", ahSite(), target.Host, ahAPIBase(), callbackHost)
+	// Local logins only ever come from this machine's browser, so do not put
+	// the proxy on the network. Remote deployments sit behind a reverse proxy
+	// and must accept forwarded traffic.
+	host := "127.0.0.1"
+	if remote {
+		host = "0.0.0.0"
+	}
+	addr := fmt.Sprintf("%s:%d", host, callbackPort)
+	listener, listenErr := net.Listen("tcp", addr)
+	if listenErr != nil {
+		return nil, fmt.Errorf("start OAuth server on %s: %w", addr, listenErr)
+	}
+
+	target, err := url.Parse(ahLoginBase())
+	if err != nil {
+		_ = listener.Close()
+		return nil, fmt.Errorf("parse AH login base: %w", err)
+	}
+
+	prefix := "/" + secret
+	localOrigin := strings.TrimSuffix(callbackHost, "/") + prefix
+	// Cookies must keep their Secure flag unless the browser will be talking
+	// to us over plain HTTP, which is only the case for local logins.
+	insecureOrigin := strings.HasPrefix(strings.ToLower(localOrigin), "http://")
+
+	tools.LogInfo("auth", "oauth_start site=%s login_host=%s api_base=%s bind=%s remote=%t", ahSite(), target.Host, ahAPIBase(), addr, remote)
 	codeCh := make(chan string, 1)
 	doneCh := make(chan error, 1)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(prefix+"/callback", func(w http.ResponseWriter, r *http.Request) {
 		code := r.URL.Query().Get("code")
 		if code == "" {
 			http.Error(w, "missing code", http.StatusBadRequest)
 			return
 		}
-		fmt.Fprintf(os.Stderr, "[ah-mcp] OAuth callback received (code len=%d)\n", len(code))
+		tools.LogInfo("auth", "oauth_callback_received code_len=%d", len(code))
 		select {
 		case codeCh <- code:
 		default:
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		io.WriteString(w, loginSuccessHTML)
+		_, _ = io.WriteString(w, loginSuccessHTML)
 	})
 
 	proxy := &httputil.ReverseProxy{
@@ -232,46 +281,61 @@ func StartOAuthFlow(ctx context.Context, callbackHost string, callbackPort int, 
 				req.Header.Set("Origin", target.Scheme+"://"+target.Host)
 			}
 			if referer := req.Header.Get("Referer"); referer != "" {
-				req.Header.Set("Referer", strings.Replace(referer, callbackHost, target.Scheme+"://"+target.Host, 1))
+				req.Header.Set("Referer", strings.Replace(referer, localOrigin, target.Scheme+"://"+target.Host, 1))
 			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			return rewriteOAuthResponse(resp, callbackHost, target.Host)
+			return rewriteOAuthResponse(resp, localOrigin, target.Host, insecureOrigin)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, proxyErr error) {
-			fmt.Fprintf(os.Stderr, "[ah-mcp] proxy error %s %s: %v\n", r.Method, r.URL.Path, proxyErr)
+			tools.LogWarn("auth", "proxy_error method=%s path=%s err=%v", r.Method, r.URL.Path, proxyErr)
 			http.Error(w, "proxy error", http.StatusBadGateway)
 		},
 	}
-	mux.Handle("/", proxy)
+	// Only the secret-scoped subtree is proxied; everything else 404s.
+	mux.Handle(prefix+"/", http.StripPrefix(prefix, proxy))
 
-	srv := &http.Server{Handler: mux}
+	srv := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 	go func() { _ = srv.Serve(listener) }()
 
+	shutdown := func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+	}
+
 	// Build the login URL that the user must open (via our local proxy).
-	loginURL = fmt.Sprintf(
+	loginURL := fmt.Sprintf(
 		"%s/login?client_id=%s&response_type=code&redirect_uri=appie://login-exit",
-		callbackHost, ahClientID(),
+		localOrigin, ahClientID(),
 	)
-	tools.LogInfo("auth", "oauth_login_url site=%s client_id=%s login_base=%s login_url=%s", ahSite(), ahClientID(), ahLoginBase(), loginURL)
+	tools.LogInfo("auth", "oauth_login_url_ready site=%s client_id=%s login_base=%s", ahSite(), ahClientID(), ahLoginBase())
+
+	cancelCh := make(chan struct{})
+	var cancelOnce sync.Once
 
 	// Wait for the code, exchange it, save tokens — all in background.
 	go func() {
-		defer func() {
-			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = srv.Shutdown(shutCtx)
-		}()
+		defer shutdown()
 
 		select {
 		case code := <-codeCh:
 			doneCh <- exchangeCodeAndSave(context.Background(), code, tokensPath)
+		case <-cancelCh:
+			doneCh <- fmt.Errorf("OAuth flow cancelled")
 		case <-time.After(oauthTimeout):
 			doneCh <- fmt.Errorf("OAuth flow timed out after 5 minutes")
 		}
 	}()
 
-	return loginURL, doneCh, nil
+	return &tools.OAuthFlow{
+		LoginURL: loginURL,
+		Done:     doneCh,
+		Cancel:   func() { cancelOnce.Do(func() { close(cancelCh) }) },
+	}, nil
 }
 
 // exchangeCodeAndSave exchanges an auth code for tokens and saves them.
@@ -313,7 +377,7 @@ func doAHPost(ctx context.Context, path string, body, result any) error {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := ahHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}
@@ -324,7 +388,8 @@ func doAHPost(ctx context.Context, path string, body, result any) error {
 		return fmt.Errorf("read response: %w", err)
 	}
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("AH API error %d: %s", resp.StatusCode, string(respBody))
+		// The body of a failed auth call can echo tokens — report the status only.
+		return fmt.Errorf("AH API error %d", resp.StatusCode)
 	}
 	if result != nil {
 		if err := json.Unmarshal(respBody, result); err != nil {
@@ -339,7 +404,7 @@ func doAHPost(ctx context.Context, path string, body, result any) error {
 //   - strips security headers that block the proxy
 //   - sanitizes cookies for HTTP use on localhost
 //   - replaces appie:// and AH login URLs in HTML/JS/JSON bodies
-func rewriteOAuthResponse(resp *http.Response, localOrigin, targetHost string) error {
+func rewriteOAuthResponse(resp *http.Response, localOrigin, targetHost string, insecureOrigin bool) error {
 	// Intercept server-side redirects to appie://
 	loc := resp.Header.Get("Location")
 	if strings.HasPrefix(loc, "appie://") {
@@ -359,11 +424,12 @@ func rewriteOAuthResponse(resp *http.Response, localOrigin, targetHost string) e
 	resp.Header.Del("Strict-Transport-Security")
 	resp.Header.Del("X-Frame-Options")
 
-	// Sanitize cookies: strip Secure/SameSite/Domain so they work over HTTP
+	// Sanitize cookies: strip Domain (it names the AH host, not ours) and
+	// SameSite. Secure is only dropped when the browser reaches us over HTTP.
 	if cookies := resp.Header.Values("Set-Cookie"); len(cookies) > 0 {
 		resp.Header.Del("Set-Cookie")
 		for _, c := range cookies {
-			resp.Header.Add("Set-Cookie", sanitizeCookie(c))
+			resp.Header.Add("Set-Cookie", sanitizeCookie(c, insecureOrigin))
 		}
 	}
 
@@ -384,16 +450,22 @@ func rewriteOAuthResponse(resp *http.Response, localOrigin, targetHost string) e
 
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	resp.ContentLength = int64(len(body))
+	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
 	resp.Header.Del("Content-Encoding")
 	return nil
 }
 
-// sanitizeCookie strips Secure, SameSite, and Domain from a Set-Cookie value.
-func sanitizeCookie(cookie string) string {
+// sanitizeCookie strips SameSite and Domain from a Set-Cookie value, and
+// Secure too when the browser will reach the proxy over plain HTTP.
+func sanitizeCookie(cookie string, insecureOrigin bool) string {
 	parts := strings.Split(cookie, ";")
 	out := parts[:1]
 	for _, p := range parts[1:] {
 		attr := strings.ToLower(strings.TrimSpace(p))
+		if attr == "secure" && !insecureOrigin {
+			out = append(out, p)
+			continue
+		}
 		if attr == "secure" ||
 			strings.HasPrefix(attr, "samesite") ||
 			strings.HasPrefix(attr, "domain") {

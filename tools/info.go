@@ -16,8 +16,8 @@ func RegisterInfoTool(s *server.MCPServer, deps Deps) {
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		return mcp.NewToolResultText(fmt.Sprintf(
-			"ah-mcp version: %s\nappie-go version: %s",
-			deps.ServerVersion, deps.AppieVersion,
+			"ah-mcp version: %s\nappie-go version: %s\nauthenticated: %t\ncached entries: %d",
+			deps.ServerVersion, deps.AppieVersion, deps.IsAuthenticated(), GlobalCache.Size(),
 		)), nil
 	})
 }
