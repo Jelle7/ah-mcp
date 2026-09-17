@@ -18,6 +18,12 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
       - name: Build binaries
         run: |
           mkdir -p dist
@@ -31,6 +37,13 @@ jobs:
 
       - name: Stage extra files
         run: cp ah-mcp.service dist/ah-mcp.service
+
+      # Published so update.sh can verify what it downloads before installing it.
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum ah-mcp-* ah-mcp.service > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Create release
         uses: softprops/action-gh-release@v2

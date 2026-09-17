@@ -1,6 +1,9 @@
 # Secrets and tokens — never commit these
 .env
-*.json
+tokens.json
+tokens.json.tmp
+config.json
+.github_token
 
 # Compiled binaries
 ah-mcp
