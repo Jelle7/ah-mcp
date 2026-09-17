@@ -3,14 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"flag"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/mark3labs/mcp-go/server"
@@ -38,11 +43,15 @@ const (
 	defaultCallbackHost = "http://localhost:9876"
 	defaultCallbackPort = 9876
 	defaultMCPPort      = 3000
+
+	readHeaderTimeout = 10 * time.Second
+	idleTimeout       = 120 * time.Second
+	shutdownTimeout   = 10 * time.Second
 )
 
 func main() {
 	transport := flag.String("transport", "sse", "Transport mode: 'sse', 'streamable-http', or 'stdio'")
-	remote := flag.Bool("remote", false, "Remote mode: disable auto browser-open on login (overridden by AH_REMOTE=true)")
+	remote := flag.Bool("remote", false, "Remote mode: bind all interfaces and disable auto browser-open on login (overridden by AH_REMOTE=true)")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
@@ -64,11 +73,14 @@ func main() {
 	callbackPort := envIntOr("AH_CALLBACK_PORT", defaultCallbackPort)
 	mcpPort := envIntOr("AH_MCP_PORT", defaultMCPPort)
 	tokensPath := TokensPath()
-	tools.LogInfo("startup", "config site=%s transport=%s remote=%t callback_host=%s callback_port=%d mcp_port=%d log_file_set=%t", ahSite(), *transport, *remote, callbackHost, callbackPort, mcpPort, os.Getenv("AH_LOG_FILE") != "")
+	mcpToken := os.Getenv("AH_MCP_TOKEN")
+
+	tools.LogInfo("startup", "config version=%s site=%s transport=%s remote=%t callback_host=%s callback_port=%d mcp_port=%d auth=%t log_file_set=%t",
+		version, ahSite(), *transport, *remote, callbackHost, callbackPort, mcpPort, mcpToken != "", os.Getenv("AH_LOG_FILE") != "")
 
 	// Ensure token directory exists with secure permissions.
-	if err := ensureTokenDir(tokensPath); err != nil {
-		fmt.Fprintf(os.Stderr, "[Albert Heijn MCP] Warning: could not create token directory: %v\n", err)
+	if err := os.MkdirAll(filepath.Dir(tokensPath), 0700); err != nil {
+		tools.LogWarn("startup", "could not create token directory: %v", err)
 	}
 
 	// Build MCP server.
@@ -81,23 +93,33 @@ func main() {
 	// Build dependency bundle.
 	deps := tools.Deps{
 		TokensPath:    tokensPath,
-		CallbackHost:  callbackHost,
-		CallbackPort:  callbackPort,
 		RemoteMode:    *remote,
 		ServerVersion: version,
 		AppieVersion:  appieVersion(),
-		GetClient:    GetClient,
-		ReloadClient: ReloadClient,
+		GetClient:     GetClient,
+		ReloadClient:  ReloadClient,
 		IsAuthenticated: func() bool {
 			return IsAuthenticated(tokensPath)
 		},
-		StartOAuthFlow: func(ctx context.Context) (string, <-chan error, error) {
-			return StartOAuthFlow(ctx, callbackHost, callbackPort, tokensPath)
+		StartOAuthFlow: func() (*tools.OAuthFlow, error) {
+			return StartOAuthFlow(callbackHost, callbackPort, tokensPath, *remote)
 		},
 		RefreshIfNeeded: func(ctx context.Context) error {
-			return RefreshIfNeeded(ctx, tokensPath)
+			refreshed, err := RefreshIfNeeded(ctx, tokensPath)
+			if err != nil {
+				return err
+			}
+			// The cached appie client holds the tokens it was created with.
+			// After a refresh those are stale — and because AH rotates refresh
+			// tokens, reusing them would eventually fail every call until the
+			// process restarts. Rebuild the client from the file we just wrote.
+			if refreshed {
+				if _, err := ReloadClient(); err != nil {
+					return fmt.Errorf("reload client after token refresh: %w", err)
+				}
+			}
+			return nil
 		},
-		Server: s,
 	}
 
 	// Register all tools.
@@ -113,51 +135,130 @@ func main() {
 
 	switch *transport {
 	case "stdio":
-		fmt.Fprintf(os.Stderr, "[Albert Heijn MCP] Starting in stdio mode (version: %s, appie-go: %s)\n", version, appieVer)
+		tools.LogInfo("startup", "starting stdio transport version=%s appie_go=%s", version, appieVer)
 		stdioSrv := server.NewStdioServer(s)
 		if err := stdioSrv.Listen(ctx, os.Stdin, os.Stdout); err != nil {
-			fmt.Fprintf(os.Stderr, "[Albert Heijn MCP] stdio server error: %v\n", err)
+			tools.LogError("startup", "stdio server error: %v", err)
 			os.Exit(1)
 		}
 	case "sse", "":
-		addr := fmt.Sprintf(":%d", mcpPort)
 		baseURL := envOr("AH_MCP_BASE_URL", fmt.Sprintf("http://localhost:%d", mcpPort))
-		mcpToken := os.Getenv("AH_MCP_TOKEN")
-		fmt.Fprintf(os.Stderr, "[Albert Heijn MCP] Starting SSE server on %s (version: %s, appie-go: %s, base URL: %s, auth: %v)\n",
-			addr, version, appieVer, baseURL, mcpToken != "")
-		sseSrv := server.NewSSEServer(s, server.WithBaseURL(baseURL), server.WithKeepAlive(true), server.WithKeepAliveInterval(5*time.Second))
-		var handler http.Handler = sseSrv
-		if mcpToken != "" {
-			handler = tokenAuthMiddleware(mcpToken, sseSrv)
-		}
-		httpServer := &http.Server{Addr: addr, Handler: handler}
-		if err := httpServer.ListenAndServe(); err != nil {
-			fmt.Fprintf(os.Stderr, "[Albert Heijn MCP] SSE server error: %v\n", err)
+		addr, err := bindAddr(mcpPort, *remote)
+		if err != nil {
+			tools.LogError("startup", "%v", err)
 			os.Exit(1)
 		}
+		if err := checkTransportAuth(addr, mcpToken, *remote); err != nil {
+			tools.LogError("startup", "%v", err)
+			os.Exit(1)
+		}
+		tools.LogInfo("startup", "starting SSE transport addr=%s version=%s appie_go=%s base_url=%s auth=%t",
+			addr, version, appieVer, baseURL, mcpToken != "")
+		sseSrv := server.NewSSEServer(s, server.WithBaseURL(baseURL), server.WithKeepAlive(true), server.WithKeepAliveInterval(5*time.Second))
+		serve(addr, wrapHandler(sseSrv, mcpToken, baseURL, mcpPort, true))
 	case "streamable-http":
-		addr := fmt.Sprintf(":%d", mcpPort)
 		baseURL := envOr("AH_MCP_BASE_URL", fmt.Sprintf("http://localhost:%d", mcpPort))
-		mcpToken := os.Getenv("AH_MCP_TOKEN")
-		fmt.Fprintf(os.Stderr, "[Albert Heijn MCP] Starting Streamable HTTP server on %s (version: %s, appie-go: %s, base URL: %s, auth: %v)\n",
+		addr, err := bindAddr(mcpPort, *remote)
+		if err != nil {
+			tools.LogError("startup", "%v", err)
+			os.Exit(1)
+		}
+		if err := checkTransportAuth(addr, mcpToken, *remote); err != nil {
+			tools.LogError("startup", "%v", err)
+			os.Exit(1)
+		}
+		tools.LogInfo("startup", "starting Streamable HTTP transport addr=%s version=%s appie_go=%s base_url=%s auth=%t",
 			addr, version, appieVer, baseURL, mcpToken != "")
 		httpSrv := server.NewStreamableHTTPServer(s,
 			server.WithEndpointPath("/mcp"),
 			server.WithHeartbeatInterval(5*time.Second),
 		)
-		var handler http.Handler = httpSrv
-		if mcpToken != "" {
-			handler = simpleAuthMiddleware(mcpToken, httpSrv)
-		}
-		httpServer := &http.Server{Addr: addr, Handler: handler}
-		if err := httpServer.ListenAndServe(); err != nil {
-			fmt.Fprintf(os.Stderr, "[Albert Heijn MCP] Streamable HTTP server error: %v\n", err)
-			os.Exit(1)
-		}
+		serve(addr, wrapHandler(httpSrv, mcpToken, baseURL, mcpPort, false))
 	default:
-		fmt.Fprintf(os.Stderr, "[Albert Heijn MCP] Unknown transport %q. Use 'sse', 'streamable-http', or 'stdio'.\n", *transport)
+		tools.LogError("startup", "unknown transport %q — use 'sse', 'streamable-http', or 'stdio'", *transport)
 		os.Exit(1)
 	}
+}
+
+// bindAddr resolves the listen address. Local runs stay on the loopback
+// interface: the server speaks for a logged-in Albert Heijn account, so
+// listening on 0.0.0.0 would hand the whole account (cart, orders, receipts,
+// address, date of birth) to anyone on the same network. Remote deployments
+// opt in explicitly via --remote/AH_REMOTE, or AH_MCP_BIND for containers.
+func bindAddr(port int, remote bool) (string, error) {
+	if host := os.Getenv("AH_MCP_BIND"); host != "" {
+		if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+			return "", fmt.Errorf("AH_MCP_BIND must be a host without a port, got %q", host)
+		}
+		return fmt.Sprintf("%s:%d", host, port), nil
+	}
+	if remote {
+		return fmt.Sprintf("0.0.0.0:%d", port), nil
+	}
+	return fmt.Sprintf("127.0.0.1:%d", port), nil
+}
+
+// isLoopbackBind reports whether addr only accepts connections from this host.
+func isLoopbackBind(addr string) bool {
+	host := addr
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		host = addr[:i]
+	}
+	host = strings.Trim(host, "[]")
+	return host == "127.0.0.1" || host == "localhost" || host == "::1"
+}
+
+// checkTransportAuth refuses to expose an authenticated AH account to the
+// network without a token, and warns when a loopback server has none.
+func checkTransportAuth(addr, token string, remote bool) error {
+	if token != "" {
+		return nil
+	}
+	if !isLoopbackBind(addr) {
+		return fmt.Errorf("refusing to listen on %s without AH_MCP_TOKEN: this server acts on your Albert Heijn account "+
+			"and would be usable by anyone who can reach that address. Set AH_MCP_TOKEN, or drop --remote/AH_MCP_BIND to bind loopback only", addr)
+	}
+	tools.LogWarn("startup", "AH_MCP_TOKEN is not set — any process on this machine can use your Albert Heijn session")
+	return nil
+}
+
+// serve runs an HTTP server with sane timeouts and graceful shutdown.
+func serve(addr string, handler http.Handler) {
+	httpServer := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+		// No ReadTimeout/WriteTimeout: SSE responses are long-lived by design.
+	}
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-stop
+		tools.LogInfo("shutdown", "signal received, draining connections")
+		shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		_ = httpServer.Shutdown(shutCtx)
+	}()
+
+	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		tools.LogError("startup", "server error: %v", err)
+		os.Exit(1)
+	}
+	tools.LogInfo("shutdown", "stopped")
+}
+
+// wrapHandler applies Origin validation and, when configured, token auth.
+func wrapHandler(next http.Handler, token, baseURL string, port int, sse bool) http.Handler {
+	if token != "" {
+		if sse {
+			next = tokenAuthMiddleware(token, next)
+		} else {
+			next = simpleAuthMiddleware(token, next)
+		}
+	}
+	return originMiddleware(allowedOrigins(baseURL, port), next)
 }
 
 // envOr returns the value of the named environment variable or the default.
@@ -178,9 +279,63 @@ func envIntOr(key string, def int) int {
 	return def
 }
 
-// ensureTokenDir creates the directory for the tokens file with mode 0700.
-func ensureTokenDir(tokensPath string) error {
-	return os.MkdirAll(parentDir(tokensPath), 0700)
+// tokenEqual compares two tokens without leaking their contents through
+// response timing.
+func tokenEqual(got, want string) bool {
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+// allowedOrigins builds the browser origins permitted to talk to this server.
+// Override the whole set with AH_MCP_ALLOWED_ORIGINS (comma separated);
+// "*" disables the check entirely.
+func allowedOrigins(baseURL string, port int) []string {
+	if v := os.Getenv("AH_MCP_ALLOWED_ORIGINS"); v != "" {
+		var out []string
+		for _, o := range strings.Split(v, ",") {
+			if o = strings.TrimSpace(o); o != "" {
+				out = append(out, strings.ToLower(strings.TrimSuffix(o, "/")))
+			}
+		}
+		return out
+	}
+	out := []string{
+		fmt.Sprintf("http://localhost:%d", port),
+		fmt.Sprintf("http://127.0.0.1:%d", port),
+		"https://claude.ai",
+		"https://claude.com",
+	}
+	if u, err := url.Parse(baseURL); err == nil && u.Scheme != "" && u.Host != "" {
+		out = append(out, strings.ToLower(u.Scheme+"://"+u.Host))
+	}
+	return out
+}
+
+// originMiddleware blocks cross-origin browser requests, which is what stops a
+// malicious web page from driving a loopback MCP server via DNS rebinding.
+// Requests without an Origin header (every non-browser MCP client) pass through.
+func originMiddleware(allowed []string, next http.Handler) http.Handler {
+	allowAll := false
+	for _, a := range allowed {
+		if a == "*" {
+			allowAll = true
+		}
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin == "" || allowAll {
+			next.ServeHTTP(w, r)
+			return
+		}
+		got := strings.ToLower(strings.TrimSuffix(origin, "/"))
+		for _, a := range allowed {
+			if got == a {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+		tools.LogWarn("http", "rejected request with disallowed Origin %q (set AH_MCP_ALLOWED_ORIGINS to permit it)", origin)
+		http.Error(w, "Forbidden origin", http.StatusForbidden)
+	})
 }
 
 // tokenAuthMiddleware rejects requests that do not carry the expected token.
@@ -190,16 +345,17 @@ func ensureTokenDir(tokensPath string) error {
 //
 // Once an SSE connection is authenticated, the sessionId it receives is
 // whitelisted so that subsequent /message posts (which don't carry the token)
-// are also allowed.
+// are also allowed. The entry is dropped when the SSE stream ends, so a
+// session id cannot be replayed after the client disconnects.
 func tokenAuthMiddleware(token string, next http.Handler) http.Handler {
 	var sessions sync.Map // sessionId string -> struct{}
 
 	isAuthed := func(r *http.Request) bool {
-		if r.Header.Get("Authorization") == "Bearer "+token {
-			return true
+		if h := r.Header.Get("Authorization"); h != "" {
+			return tokenEqual(h, "Bearer "+token)
 		}
-		if r.URL.Query().Get("token") == token {
-			return true
+		if q := r.URL.Query().Get("token"); q != "" {
+			return tokenEqual(q, token)
 		}
 		return false
 	}
@@ -221,9 +377,12 @@ func tokenAuthMiddleware(token string, next http.Handler) http.Handler {
 		}
 
 		// For SSE connections, wrap the ResponseWriter to capture the sessionId
-		// from the "event: endpoint" SSE message and whitelist it.
+		// from the "event: endpoint" SSE message and whitelist it for as long
+		// as the stream is open.
 		if strings.HasPrefix(r.URL.Path, "/sse") {
-			next.ServeHTTP(&sessionCapture{ResponseWriter: w, sessions: &sessions}, r)
+			sc := &sessionCapture{ResponseWriter: w, sessions: &sessions}
+			defer sc.forget()
+			next.ServeHTTP(sc, r)
 			return
 		}
 
@@ -236,6 +395,8 @@ func tokenAuthMiddleware(token string, next http.Handler) http.Handler {
 type sessionCapture struct {
 	http.ResponseWriter
 	sessions *sync.Map
+	mu       sync.Mutex
+	sid      string
 }
 
 func (sc *sessionCapture) Write(b []byte) (int, error) {
@@ -245,10 +406,23 @@ func (sc *sessionCapture) Write(b []byte) (int, error) {
 			rest = rest[:end]
 		}
 		if rest != "" {
+			sc.mu.Lock()
+			sc.sid = rest
+			sc.mu.Unlock()
 			sc.sessions.Store(rest, struct{}{})
 		}
 	}
 	return sc.ResponseWriter.Write(b)
+}
+
+// forget revokes the captured sessionId once the SSE stream is finished.
+func (sc *sessionCapture) forget() {
+	sc.mu.Lock()
+	sid := sc.sid
+	sc.mu.Unlock()
+	if sid != "" {
+		sc.sessions.Delete(sid)
+	}
 }
 
 func (sc *sessionCapture) Flush() {
@@ -261,11 +435,11 @@ func (sc *sessionCapture) Flush() {
 // Used for streamable-http where each request is independent (no session tracking needed).
 func simpleAuthMiddleware(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") == "Bearer "+token {
+		if h := r.Header.Get("Authorization"); h != "" && tokenEqual(h, "Bearer "+token) {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if r.URL.Query().Get("token") == token {
+		if q := r.URL.Query().Get("token"); q != "" && tokenEqual(q, token) {
 			next.ServeHTTP(w, r)
 			return
 		}

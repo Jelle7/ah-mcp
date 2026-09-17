@@ -64,9 +64,12 @@ Authentication is handled entirely through a reverse-proxy OAuth flow — no tok
 2. Run it:
    ```bash
    ./ah-mcp --transport stdio              # local client — browser opens automatically on login
-   ./ah-mcp --transport sse                # local SSE — browser opens automatically on login
-   ./ah-mcp --transport sse --remote       # remote SSE server — login returns a URL instead
-   ./ah-mcp --transport streamable-http    # remote Streamable HTTP — more stable through proxies
+   ./ah-mcp --transport sse                # local SSE on 127.0.0.1 — browser opens automatically
+   ./ah-mcp --transport streamable-http    # local Streamable HTTP on 127.0.0.1
+
+   # Remote: binds 0.0.0.0 and returns a login URL instead of opening a browser.
+   # AH_MCP_TOKEN is required — startup fails without it.
+   AH_MCP_TOKEN=$(openssl rand -hex 32) ./ah-mcp --transport streamable-http --remote
    ```
 3. Ask your AI assistant to call **`ah_login`**. In local mode the browser opens automatically; in remote mode the assistant returns a URL for you to open.
 
@@ -92,9 +95,23 @@ Requires Go 1.23+.
 | `AH_MCP_BASE_URL` | `http://localhost:3000` | Public base URL advertised to MCP clients. **Must be set for remote deployments** — otherwise clients receive a `localhost` URL they cannot reach. Example: `https://myserver.example.com` |
 | `AH_TOKENS_PATH` | `~/.config/ah-mcp/tokens.json` | Override the XDG token storage path. Directory is created automatically (mode `0700`). File is written with mode `0600`. |
 | `AH_REMOTE` | `false` | Set to `true` to enable remote mode (same as `--remote` flag). Disables automatic browser opening on login. |
-| `AH_MCP_TOKEN` | *(unset)* | Secret token required to access the SSE server. When set, all requests must supply it via `Authorization: Bearer <token>` header or `?token=<token>` query parameter. Strongly recommended for public deployments. |
+| `AH_MCP_TOKEN` | *(unset)* | Secret token required to access the HTTP server. Supply it as `Authorization: Bearer <token>` or `?token=<token>`. **Required** whenever the server binds a non-loopback address — startup fails without it. |
+| `AH_MCP_BIND` | loopback, or `0.0.0.0` with `--remote` | Interface to listen on (host only, no port). Set to `0.0.0.0` for containers that need a public bind without remote mode. Requires `AH_MCP_TOKEN`. |
+| `AH_MCP_ALLOWED_ORIGINS` | base URL + localhost + `https://claude.ai` | Comma-separated browser origins allowed to call the server. Requests with no `Origin` header (all non-browser MCP clients) always pass. Set to `*` to disable the check. |
 
 Copy `.env.example` to `.env` and uncomment lines you want to change.
+
+## Security
+
+This server acts on a logged-in Albert Heijn account: anything that can reach it can read your orders, receipts, address and date of birth, and change your cart. The defaults are set accordingly.
+
+- **Binds loopback by default.** `sse` and `streamable-http` listen on `127.0.0.1` unless you pass `--remote` (or set `AH_REMOTE=true` / `AH_MCP_BIND`).
+- **A network bind requires a token.** Starting with a non-loopback address and no `AH_MCP_TOKEN` is refused outright. A loopback server without a token logs a warning — any local process can then use your session.
+- **Origin checking.** Browser requests from an origin outside `AH_MCP_ALLOWED_ORIGINS` are rejected, which is what stops a malicious web page reaching a loopback server via DNS rebinding. Non-browser clients send no `Origin` and are unaffected.
+- **The login proxy is scoped to a one-time secret.** `ah_login` starts a short-lived reverse proxy under a random `/<secret>/` path that only appears in the login URL returned over MCP. Without it the proxy would relay to AH's login host for anyone who could reach the port, and its callback would accept an authorization code from a stranger — AH's flow carries no `state` parameter, so that would let someone bind *their* account to your server.
+- **Tokens on disk.** Written atomically, file mode `0600`, directory `0700`.
+- **Prefer the header over `?token=`.** Query strings land in reverse-proxy access logs, browser history and `Referer` headers. Use `Authorization: Bearer <token>` where your client supports it.
+- **Put TLS in front for remote deployments.** The server speaks plain HTTP; terminate TLS in nginx/Caddy.
 
 ## Token storage
 
@@ -150,23 +167,30 @@ Streamable HTTP uses regular HTTP requests instead of a persistent SSE connectio
 
 ### Claude.ai (web) — SSE (legacy)
 
-1. Start the server: `./ah-mcp --transport sse` (exposes port 3000).
+1. Start the server on your remote machine with a token set:
+   ```bash
+   AH_MCP_TOKEN=$(openssl rand -hex 32) ./ah-mcp --transport sse --remote
+   ```
+   Without `--remote` the server binds loopback only; without `AH_MCP_TOKEN` a non-loopback bind is refused.
 2. Open Claude.ai → Settings → Connections → Add MCP server.
-3. Paste the SSE URL: `http://your-server:3000/sse`
+3. Paste the SSE URL: `https://your-server/sse?token=your-secret-token`
 
 ### Claude Desktop — SSE or stdio
 
-**SSE** (remote server — run with `--remote` on the server side):
+**SSE** (remote server — run with `--remote` and `AH_MCP_TOKEN` on the server side):
 
 ```json
 {
   "mcpServers": {
     "ah": {
-      "url": "http://your-server:3000/sse"
+      "url": "https://your-server/sse",
+      "headers": { "Authorization": "Bearer your-secret-token" }
     }
   }
 }
 ```
+
+If your client cannot send headers, fall back to `https://your-server/sse?token=your-secret-token` — but note the token will appear in proxy logs.
 
 **stdio** (local binary):
 
@@ -235,12 +259,15 @@ Tokens are stored automatically at `/home/ah-mcp/.config/ah-mcp/tokens.json` —
 |---|---|
 | `ah_login` | Log in via browser OAuth. First call returns a URL; call again after completing login. |
 | `ah_logout` | Delete stored tokens to log out or switch accounts. |
+| `ah_get_server_info` | Server and appie-go versions, auth state, cache size. |
 
 ### Products
 
 | Tool | Description |
 |---|---|
 | `ah_search_products` | Search products by keyword (Dutch terms preferred). |
+| `ah_search_products_bulk` | Search several keywords in one call (max 10). Saves tool-call quota. |
+| `ah_get_products_bulk` | Details for several product IDs in one call (max 20). |
 | `ah_search_products_filtered` | Search with optional `bonus=true` filter for on-sale items only. |
 | `ah_get_product` | Full detail for one product by ID. Add `include_nutritional_info=true` for calories, fat, protein, etc. |
 | `ah_get_bonus_offers` | All current bonus/promotional offers. Optional keyword filter. |
@@ -265,7 +292,7 @@ Tokens are stored automatically at `/home/ah-mcp/.config/ah-mcp/tokens.json` —
 | `ah_get_order_history` | Upcoming delivery orders with status and modifiable flag. |
 | `ah_get_past_orders` | Past/delivered orders. |
 | `ah_get_order_details` | Full item list for a specific past or upcoming order. |
-| `ah_get_frequent_items` | Products you order most often, ranked by frequency. |
+| `ah_get_frequent_items` | Products you order most often, ranked by frequency. Analyses the 25 most recent orders by default (`max_orders`, up to 100). |
 | `ah_reopen_order` | Unlock a submitted order for editing (before closing time). ⚠️ unconfirmed |
 | `ah_update_order_items` | Add/change/remove items in a reopened order. ⚠️ unconfirmed |
 | `ah_revert_order` | Resubmit a reopened order. **Always call this after `ah_reopen_order`.** ⚠️ unconfirmed |
@@ -278,7 +305,7 @@ Tokens are stored automatically at `/home/ah-mcp/.config/ah-mcp/tokens.json` —
 | `ah_add_to_shopping_list` | Add products by ID and quantity. |
 | `ah_add_free_text_to_shopping_list` | Add a free-text reminder (no product ID needed). |
 | `ah_remove_from_shopping_list` | Remove items by product ID or free-text name. |
-| `ah_check_shopping_list_item` | Tick or untick an item on the list. ⚠️ broken (listItemId=0 in API) |
+| `ah_check_shopping_list_item` | Tick or untick a **favourite-list** item. The main Boodschappenlijst returns `listItemId=0` for every item, so its items cannot be ticked here — do that in the AH app. |
 | `ah_clear_shopping_list` | Remove all items from the list. Requires `confirm=yes`. |
 | `ah_shopping_list_to_order` | Move all unchecked product items from your list to the cart. |
 | `ah_get_favorite_lists` | List all named favourite lists with IDs. |
@@ -315,11 +342,20 @@ Call `ah_logout` then `ah_login`. Or delete `tokens.json` manually:
 **Last-chance items require a store**
 `ah_get_last_chance_items` needs a store ID or postal code — bargain items are store-specific. Provide `store_id` or `postal_code` as a parameter.
 
+**"refusing to listen ... without AH_MCP_TOKEN"**
+You asked for a network bind (`--remote`, `AH_REMOTE=true` or `AH_MCP_BIND`) without a token. Set `AH_MCP_TOKEN`, or drop those to bind loopback only.
+
+**403 "Forbidden origin"**
+A browser called the server from an origin that is not allowed. Add it to `AH_MCP_ALLOWED_ORIGINS` (comma separated), or set that to `*` to disable the check.
+
+**Client cannot reach the server on another machine**
+By default the server only listens on `127.0.0.1`. Start it with `--remote` (plus `AH_MCP_TOKEN`) to listen on all interfaces.
+
 **"Not logged in" error**
 Run `ah_login` first. In local mode the browser opens automatically; in remote mode (`--remote` / `AH_REMOTE=true`) open the URL the assistant returns.
 
 ## Acknowledgements
 
-**ah-mcp** is built on top of [**appie-go**](https://github.com/gwillem/appie-go) — a Go client library for the Albert Heijn mobile API by [@gwillem](https://github.com/gwillem). It provides the authenticated HTTP client, all API call implementations (product search, bonus offers, orders, shopping lists, member profile, bargain items), and the OAuth token format. This project uses it as a library dependency without modification.
+**ah-mcp** is built on top of [**appie-go**](https://github.com/gwillem/appie-go) — a Go client library for the Albert Heijn mobile API by [@gwillem](https://github.com/gwillem). It provides the authenticated HTTP client, all API call implementations (product search, bonus offers, orders, shopping lists, member profile, bargain items), and the OAuth token format. This project depends on it as a library. Note that `go.mod` currently pins a fork (`github.com/celerex/appie-go`) via a `replace` directive to pick up Belgium support; `go.sum` pins the exact revision.
 
 The OAuth reverse-proxy login flow in `auth.go` is inspired by the approach in appie-go's `login.go`, adapted to return a URL string rather than open a browser — making it safe for server-side MCP use.

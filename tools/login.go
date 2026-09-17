@@ -8,7 +8,6 @@ import (
 	"runtime"
 	"sync"
 
-	appie "github.com/gwillem/appie-go"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -30,51 +29,30 @@ func openBrowser(url string) {
 	}()
 }
 
-// Deps holds the dependencies injected into every tool handler.
-type Deps struct {
-	// TokensPath is the path to the tokens.json file.
-	TokensPath string
-	// CallbackHost is the base URL for the OAuth callback server (e.g. http://localhost:9876).
-	CallbackHost string
-	// CallbackPort is the port the temporary OAuth proxy listens on.
-	CallbackPort int
-	// RemoteMode disables automatic browser opening during login.
-	// Set this when the server runs on a machine without a display (remote/cloud).
-	RemoteMode bool
-	// GetClient returns the authenticated appie client.
-	GetClient func() (*appie.Client, error)
-	// ReloadClient recreates the client from the tokens file.
-	ReloadClient func() (*appie.Client, error)
-	// IsAuthenticated checks whether valid tokens are on disk.
-	IsAuthenticated func() bool
-	// StartOAuthFlow starts the proxy and returns (loginURL, doneChan, err).
-	StartOAuthFlow func(ctx context.Context) (string, <-chan error, error)
-	// RefreshIfNeeded refreshes the access token if it is close to expiry.
-	RefreshIfNeeded func(ctx context.Context) error
-	// Server is the MCP server instance (kept for future use).
-	Server *server.MCPServer
-	// ServerVersion is the build version of the MCP server binary.
-	ServerVersion string
-	// AppieVersion is the version of the appie-go library in use.
-	AppieVersion string
-}
-
-func notAuthResult() *mcp.CallToolResult {
-	return mcp.NewToolResultError(`{"error":"not_authenticated","message":"Not logged in. Call ah_login first."}`)
-}
-
-func errResult(msg string) *mcp.CallToolResult {
-	return mcp.NewToolResultError(msg)
-}
-
-// oauthFlow tracks an in-progress OAuth flow across tool calls.
-// ah_login call 1 → starts the flow, returns the URL immediately.
-// ah_login call 2 → checks whether the browser callback was received.
+// oauthFlow tracks an in-progress OAuth flow across tool calls. The callback
+// server owns a fixed port, so the flow must outlive the tool call that
+// started it — a cancelled call leaves it running and a later ah_login
+// resumes waiting on the same flow rather than colliding on the port.
 var oauthFlow struct {
 	sync.Mutex
 	active   bool
 	loginURL string
 	done     <-chan error
+	cancel   func()
+}
+
+// clearOAuthFlow marks the flow finished and tears down its callback server.
+func clearOAuthFlow() {
+	oauthFlow.Lock()
+	cancel := oauthFlow.cancel
+	oauthFlow.active = false
+	oauthFlow.cancel = nil
+	oauthFlow.done = nil
+	oauthFlow.loginURL = ""
+	oauthFlow.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // RegisterLoginTool registers the ah_login and ah_logout MCP tools.
@@ -104,6 +82,10 @@ func registerLogout(s *server.MCPServer, deps Deps) {
 		),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		// Always drop an in-flight login, even when no tokens are stored —
+		// otherwise its callback server keeps the port until it times out.
+		clearOAuthFlow()
+
 		if !deps.IsAuthenticated() {
 			return mcp.NewToolResultText("Already logged out (no active session)."), nil
 		}
@@ -111,11 +93,10 @@ func registerLogout(s *server.MCPServer, deps Deps) {
 			return errResult(fmt.Sprintf("Failed to remove tokens: %v", err)), nil
 		}
 		// Reset the in-memory client so the next call gets a fresh unauthenticated state.
-		deps.ReloadClient() //nolint:errcheck — error just means no tokens, which is expected
-		// Also reset any in-progress OAuth flow.
-		oauthFlow.Lock()
-		oauthFlow.active = false
-		oauthFlow.Unlock()
+		if _, err := deps.ReloadClient(); err != nil {
+			LogWarn("ah_logout", "reload client after logout: %v", err)
+		}
+		LogInfo("ah_logout", "tokens removed")
 		return mcp.NewToolResultText("Logged out. Call ah_login to authenticate again."), nil
 	})
 }
@@ -125,11 +106,19 @@ func loginSuccess(ctx context.Context, deps Deps) (*mcp.CallToolResult, error) {
 	if err != nil {
 		return errResult(fmt.Sprintf("Login succeeded but could not reload client: %v", err)), nil
 	}
+	LogInfo("ah_login", "login_success")
 	member, err := c.GetMember(ctx)
 	if err != nil {
 		return mcp.NewToolResultText("Login successful!"), nil
 	}
 	return mcp.NewToolResultText(fmt.Sprintf("Login successful! Connected as %s %s.", member.FirstName, member.LastName)), nil
+}
+
+func stillWaitingResult(url string) *mcp.CallToolResult {
+	return mcp.NewToolResultText(fmt.Sprintf(
+		"Still waiting for browser login. Please open this URL if you haven't yet:\n\n%s\n\nThen call ah_login again to confirm.",
+		url,
+	))
 }
 
 func handleLogin(ctx context.Context, deps Deps) (*mcp.CallToolResult, error) {
@@ -148,64 +137,69 @@ func handleLogin(ctx context.Context, deps Deps) (*mcp.CallToolResult, error) {
 
 	oauthFlow.Lock()
 
-	// Remote mode — second call: check whether the browser callback arrived.
+	// A flow is already running — either from a previous remote-mode call or
+	// from a local call whose context was cancelled before the user finished.
 	if oauthFlow.active {
-		select {
-		case loginErr := <-oauthFlow.done:
-			oauthFlow.active = false
-			oauthFlow.Unlock()
-			if loginErr != nil {
-				return errResult(fmt.Sprintf("Login failed: %v", loginErr)), nil
-			}
-			return loginSuccess(ctx, deps)
-		default:
-			url := oauthFlow.loginURL
-			oauthFlow.Unlock()
-			return mcp.NewToolResultText(fmt.Sprintf(
-				"Still waiting for browser login. Please open this URL if you haven't yet:\n\n%s\n\nThen call ah_login again to confirm.",
-				url,
-			)), nil
-		}
+		done := oauthFlow.done
+		url := oauthFlow.loginURL
+		oauthFlow.Unlock()
+		return awaitLogin(ctx, deps, done, url, deps.RemoteMode)
 	}
 
-	// Start the OAuth proxy.
-	loginURL, done, err := deps.StartOAuthFlow(ctx)
+	flow, err := deps.StartOAuthFlow()
 	if err != nil {
 		oauthFlow.Unlock()
+		LogError("ah_login", "start oauth flow: %v", err)
 		return errResult(fmt.Sprintf("Failed to start OAuth flow: %v", err)), nil
 	}
 
 	oauthFlow.active = true
-	oauthFlow.loginURL = loginURL
-	oauthFlow.done = done
+	oauthFlow.loginURL = flow.LoginURL
+	oauthFlow.done = flow.Done
+	oauthFlow.cancel = flow.Cancel
+	oauthFlow.Unlock()
 
-	if !deps.RemoteMode {
-		// Local mode: open the browser, then BLOCK until the callback arrives.
-		// The agent does not need to call ah_login a second time.
-		openBrowser(loginURL)
-		oauthFlow.Unlock()
-
-		select {
-		case loginErr := <-done:
-			oauthFlow.Lock()
-			oauthFlow.active = false
-			oauthFlow.Unlock()
-			if loginErr != nil {
-				return errResult(fmt.Sprintf("Login failed: %v", loginErr)), nil
-			}
-			return loginSuccess(ctx, deps)
-		case <-ctx.Done():
-			oauthFlow.Lock()
-			oauthFlow.active = false
-			oauthFlow.Unlock()
-			return errResult("Login cancelled (context deadline exceeded)."), nil
-		}
+	if deps.RemoteMode {
+		// Remote mode: return the URL — the user calls ah_login again after
+		// completing the browser flow.
+		return mcp.NewToolResultText(fmt.Sprintf(
+			"Please open this URL in your browser to log in to Albert Heijn:\n\n%s\n\nCall ah_login again once you have completed the login.",
+			flow.LoginURL,
+		)), nil
 	}
 
-	// Remote mode: unlock and return the URL — user will call ah_login again after completing.
-	oauthFlow.Unlock()
-	return mcp.NewToolResultText(fmt.Sprintf(
-		"Please open this URL in your browser to log in to Albert Heijn:\n\n%s\n\nCall ah_login again once you have completed the login.",
-		loginURL,
-	)), nil
+	// Local mode: open the browser, then block until the callback arrives.
+	// The agent does not need to call ah_login a second time.
+	openBrowser(flow.LoginURL)
+	return awaitLogin(ctx, deps, flow.Done, flow.LoginURL, false)
+}
+
+// awaitLogin waits for a flow to finish. In poll mode it returns immediately
+// with the pending URL; otherwise it blocks until the flow completes or ctx is
+// cancelled. A cancelled context deliberately leaves the flow running so the
+// callback server keeps the port and the next ah_login can pick it back up.
+func awaitLogin(ctx context.Context, deps Deps, done <-chan error, url string, poll bool) (*mcp.CallToolResult, error) {
+	if poll {
+		select {
+		case loginErr := <-done:
+			return finishLogin(ctx, deps, loginErr)
+		default:
+			return stillWaitingResult(url), nil
+		}
+	}
+	select {
+	case loginErr := <-done:
+		return finishLogin(ctx, deps, loginErr)
+	case <-ctx.Done():
+		return stillWaitingResult(url), nil
+	}
+}
+
+func finishLogin(ctx context.Context, deps Deps, loginErr error) (*mcp.CallToolResult, error) {
+	clearOAuthFlow()
+	if loginErr != nil {
+		LogError("ah_login", "login failed: %v", loginErr)
+		return errResult(fmt.Sprintf("Login failed: %v", loginErr)), nil
+	}
+	return loginSuccess(ctx, deps)
 }
